@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/Varsilias/concile/internal/command"
+	"github.com/Varsilias/concile/internal/telemetry"
+	"github.com/Varsilias/concile/internal/utils"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -23,13 +25,18 @@ func init() {
 			if path == "" {
 				return fmt.Errorf("file path is required (use --file /path/to/file)")
 			}
-			Run(path)
-			return nil
+
+			return Run(path)
 		},
 	)
 }
 
-func Run(filePath string) {
+func Run(filePath string) error {
+	defer telemetry.Track("XLSX Conversion")()
+	path, err := utils.ResolvePath(filePath)
+	if err != nil {
+		return fmt.Errorf("error resolving file path: %v", err)
+	}
 	wd, err := os.Getwd()
 	directoryPath := filepath.Join(wd, "data")
 	if err != nil {
@@ -41,7 +48,7 @@ func Run(filePath string) {
 		log.Fatal("Could not create data directory")
 	}
 
-	f, err := excelize.OpenFile(filePath)
+	f, err := excelize.OpenFile(path)
 	if err != nil {
 		log.Fatalf("Open error: %v", err)
 	}
@@ -97,4 +104,6 @@ func Run(filePath string) {
 		}
 		outFile.Close()
 	}
+	return nil
+
 }

@@ -2,7 +2,7 @@ package pkg
 
 import "time"
 
-type IngestionStats struct {
+type Stats struct {
 	Processed  int
 	Failed     int
 	Duplicates int

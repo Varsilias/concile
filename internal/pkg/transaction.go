@@ -35,3 +35,7 @@ type CanonicalTransaction struct {
 	Currency    string
 	Type        TransactionType
 }
+
+func Normalize(rawTrx RawTransaction) (CanonicalTransaction, error) {
+	return CanonicalTransaction{}, nil
+}
