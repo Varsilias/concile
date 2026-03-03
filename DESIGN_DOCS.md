@@ -58,3 +58,148 @@ Processing [outflow] -> /Users/danielokoronkwo/Projects/personal/concile/data/ou
 ## Powerful Insights for today
 - Ingested 100k JSONL file and did it in an average of **180ms**, that's insane because the goal for now is 100k in under `3s`. I still need to make some conversion, which I bet increases the time taken.
 - Once the full implementation is in place, I will write a benchmark test for automated benchmarking
+
+# Day 3 - 3rd March, 2026
+Today was for implementing fully the Normalisation from `RawTransaction` Record struct to `CanonicalTransaction`. I left this initially because the implementation in my head felt like I was going to write too much code and that did not feel normal. I eventually implemented it today and let's just say it had a lot of If-Else statements in there which still feels weird to me but hey this is the Go world, you have to be explicit.
+
+After implemetation, I had to do a lot of testing and profiling. For my manual test, I initially saw my number go from `160+ms` on average to `600ms` on average still on 100k records and while it does not scream too much, I felt uneasy and wanted to explain it away with all the parsing and conversion I performed in the Normalisation function. Apparently, the first version of the function implementation was failing and that cause the increase in time spent. After correction we came back to `200ms` average, which is great.
+
+I then went into Profiling and Benchmarking Test. I Profiled the CPU usage to see what is going on. I added the following snippet to my entry file
+```go
+f, _ := os.Create("cpu.prof")
+pprof.StartCPUProfile(f)
+defer pprof.StopCPUProfile()
+```
+This snippet override create a `cpu.prof` file after every run which you use to run analysis on how the program performs in terms of CPU usage. The command to trigger the profiling is
+`go tool pprof cpu.prof`
+
+This command shows an interactive shell-like prompt, if you enter thr prompt `top` and execute, it gives you output similar to what you see below
+
+Here is the first ever result. 
+```zsh
+File: main
+Type: cpu
+Time: 2026-03-03 18:05:50 WAT
+Duration: 1.61s, Total samples = 320ms (19.82%)
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top 
+Showing nodes accounting for 320ms, 100% of 320ms total
+Showing top 10 nodes out of 48
+      flat  flat%   sum%        cum   cum%
+     290ms 90.62% 90.62%      290ms 90.62%  syscall.rawsyscalln
+      10ms  3.12% 93.75%       10ms  3.12%  runtime.memclrNoHeapPointers
+      10ms  3.12% 96.88%       10ms  3.12%  runtime.pthread_cond_wait
+      10ms  3.12%   100%       10ms  3.12%  runtime.typePointers.nextFast
+         0     0%   100%       30ms  9.38%  bufio.(*Reader).ReadSlice
+         0     0%   100%       30ms  9.38%  bufio.(*Reader).fill
+         0     0%   100%      300ms 93.75%  github.com/Varsilias/concile/internal/processor.Run
+         0     0%   100%      300ms 93.75%  github.com/Varsilias/concile/internal/processor.init.0.func2
+         0     0%   100%       10ms  3.12%  github.com/Varsilias/concile/internal/processor.reconcile
+         0     0%   100%       30ms  9.38%  internal/poll.(*FD).Read
+(pprof) %           
+```
+
+After some explanation from my buddy ChatGPT, I got to know that we did relative okay, but the `90.62%` in the first result, shows that the bottleneck albeit not much overall is `syscall`.
+In simple terms, they problem is that we spend most of our processing time waiting for the CPU to respond to disk read requests. This is goodnews because our computation is not heavy per say, but the syscall is using more time that should be happening.
+
+> Essentially, our bottleneck is not Compute related but IO-bound
+
+**The Solution:** Is a general sense of things, if you want to increase thoroughput for any batch processing system, typically you increase the size of each batch to be processed. The `NewReader` of the `bufio` package has an internal batch limit of `4KB`, I had to switch to `NewReaderSize` which allows to customise the size of the internal batch like so `buffer := bufio.NewReaderSize(f, 1<<20)`, I increased it to 1MB with bit shifting. Since we are doing more context switching as a result with each syscalls, why not reduce the number of times we have to ask. For context, the file being processed was `27MB` which was around
+```
+27MB / 4KB ≈ 6912 read syscalls
+```
+After the change, here is the new number
+```
+27MB / 1MB ≈ 27 read syscalls
+```
+
+~7000 syscalls to ~27. By now I believe you get the idea. Here is the new result
+
+```zsh
+File: main
+Type: cpu
+Time: 2026-03-03 19:06:06 WAT
+Duration: 404.35ms, Total samples = 210ms (51.94%)
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top
+Showing nodes accounting for 190ms, 90.48% of 210ms total
+Showing top 10 nodes out of 81
+      flat  flat%   sum%        cum   cum%
+      50ms 23.81% 23.81%       50ms 23.81%  syscall.rawsyscalln
+      30ms 14.29% 38.10%       30ms 14.29%  runtime.madvise
+      20ms  9.52% 47.62%       20ms  9.52%  encoding/json.unquoteBytes
+      20ms  9.52% 57.14%       20ms  9.52%  runtime.(*mspan).init
+      20ms  9.52% 66.67%       20ms  9.52%  runtime.pthread_cond_signal
+      10ms  4.76% 71.43%       10ms  4.76%  encoding/json.stateBeginStringOrEmpty
+      10ms  4.76% 76.19%       10ms  4.76%  encoding/json.stateEndValue
+      10ms  4.76% 80.95%       10ms  4.76%  runtime.memclrNoHeapPointers
+      10ms  4.76% 85.71%       10ms  4.76%  runtime.mmap
+      10ms  4.76% 90.48%       10ms  4.76%  runtime.pthread_cond_wait
+```
+
+I also ran some BenchMark Tests on the Normalisation function and here is the result
+```zsh
+goos: darwin
+goarch: arm64
+pkg: github.com/Varsilias/concile/internal/pkg
+cpu: Apple M4
+BenchmarkNormalizeInflow-10     	 7419302	       140.5 ns/op	      16 B/op	       1 allocs/op
+BenchmarkNormalizeOutflow-10    	11684474	       103.3 ns/op	       0 B/op	       0 allocs/op
+PASS
+```
+Essential for outflow transaction types, we have 0 allocation per operation, which means in simple terms that the Garbage Collector will not have any work to do even if we ran the function on 1 Million json records. But there is 16 Byte allocation per operation for Inflow records which I am yet to figure out where it is happening. My guts says it has something to do with some kind of `string` operation I am doing but hey this is where I stopped for now.
+
+I ran a memory profiling on the InflowBenchMark Test and the result
+
+Running the test
+```zsh
+ go test -bench=BenchmarkNormalizeInflow ./internal/pkg -benchmem -memprofile mem.prof
+
+goos: darwin
+goarch: arm64
+pkg: github.com/Varsilias/concile/internal/pkg
+cpu: Apple M4
+BenchmarkNormalizeInflow-10    	 7276989	       142.6 ns/op	      16 B/op	       1 allocs/op
+PASS
+ok  	github.com/Varsilias/concile/internal/pkg	2.656s
+```
+
+The Profiling
+```zsh
+File: pkg.test
+Type: alloc_space
+Time: 2026-03-03 18:45:50 WAT
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top
+Showing nodes accounting for 119MB, 100% of 119MB total
+Dropped 10 nodes (cum <= 0.60MB)
+Showing top 10 nodes out of 18
+      flat  flat%   sum%        cum   cum%
+     117MB 98.32% 98.32%      117MB 98.32%  internal/bytealg.MakeNoZero
+       2MB  1.68%   100%        2MB  1.68%  runtime.mallocgc
+         0     0%   100%      117MB 98.32%  github.com/Varsilias/concile/internal/pkg.BenchmarkNormalizeInflow
+         0     0%   100%      117MB 98.32%  github.com/Varsilias/concile/internal/pkg.Normalize
+         0     0%   100%        1MB  0.84%  runtime.(*scavengerState).sleep
+         0     0%   100%        1MB  0.84%  runtime.(*timer).maybeAdd
+         0     0%   100%        1MB  0.84%  runtime.(*timer).modify
+         0     0%   100%        1MB  0.84%  runtime.(*timer).reset (inline)
+         0     0%   100%        1MB  0.84%  runtime.(*timers).addHeap
+         0     0%   100%     1.50MB  1.26%  runtime.bgscavenge
+```
+
+Here is my personal telemetry record after today's implementation
+```bash
+go run main.go ingest --file=~/Projects/personal/concile/data/inflow.jsonl
+Processed 27.16 MiB of data
+⏱️  Transaction Processor took 205.727166ms
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      100000
+Failed:         0
+Duplicates:     0
+Duration:       205.729625ms
+
+==============================
+```

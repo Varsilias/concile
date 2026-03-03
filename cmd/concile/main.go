@@ -4,12 +4,17 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime/pprof"
 
 	"github.com/Varsilias/concile/internal/command"
 	_ "github.com/Varsilias/concile/internal/hook" // The loader
 )
 
 func main() {
+	f, _ := os.Create("cpu.prof")
+	pprof.StartCPUProfile(f)
+	defer pprof.StopCPUProfile()
+
 	command.Register("help", "Show CLI usage",
 		func(fs *flag.FlagSet, values map[string]*string) {
 			values["file"] = fs.String("file", "", "XLSX file path")

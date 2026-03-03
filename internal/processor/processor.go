@@ -41,18 +41,21 @@ func Run(filePath string) error {
 	if err != nil {
 		return fmt.Errorf("error resolving file path: %v", err)
 	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	buffer := bufio.NewReader(f)
+	var store = make([]pkg.CanonicalTransaction, 0, 100)
+
+	buffer := bufio.NewReaderSize(f, 1<<20)
 	size := 0
 	lineNumber := 0
 
 	for {
-		line, err := buffer.ReadSlice('\n') // Given our file structure, we will never hit [bufio.ErrBufferFull] error
+		line, err := buffer.ReadSlice('\n') // Given our file structure and each line size, we will never hit [bufio.ErrBufferFull] error
 
 		if err != nil && !errors.Is(err, io.EOF) {
 			return fmt.Errorf("corrupted file content: %v", err)
@@ -61,12 +64,14 @@ func Run(filePath string) error {
 		if len(line) > 0 {
 			lineNumber++
 			size += len(line)
-			isDup, recErr := reconcile(line, lineNumber, seen)
+			trx, isDup, recErr := reconcile(line, lineNumber, seen)
 			if recErr != nil {
+				log.Printf("Failed processing line %d\n, reason %v", lineNumber, recErr)
 				stats.IncrFailed()
 			} else if isDup {
 				stats.IncrDuplicates()
 			} else {
+				store = append(store, trx)
 				stats.IncrProcessed()
 			}
 		}
@@ -81,20 +86,26 @@ func Run(filePath string) error {
 	return nil
 }
 
-func reconcile(line []byte, lineNumber int, seen map[string]struct{}) (bool, error) {
+func reconcile(line []byte, lineNumber int, seen map[string]struct{}) (pkg.CanonicalTransaction, bool, error) {
+	var cnTrxEmpty pkg.CanonicalTransaction
 	var rawTrx pkg.RawTransaction
 	if err := json.Unmarshal(line, &rawTrx); err != nil {
 		log.Printf("error processing line number %d\n", lineNumber)
-		return false, err
+		return cnTrxEmpty, false, err
 	}
 
 	// checking for duplicate
 	ref := string(rawTrx.Reference)
 	if _, ok := seen[ref]; ok {
 		log.Printf("duplicate reference [%s] detected on line %d\n", rawTrx.Reference, lineNumber)
-		return true, nil
+		return cnTrxEmpty, true, nil
 	}
 	seen[rawTrx.Reference] = struct{}{}
 
-	return false, nil
+	cnTrx, err := pkg.Normalize(rawTrx)
+	if err != nil {
+		return cnTrxEmpty, false, err
+	}
+
+	return cnTrx, false, nil
 }
