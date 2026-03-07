@@ -203,3 +203,215 @@ Duration:       205.729625ms
 
 ==============================
 ```
+
+# Day 4 - 7th March, 2026
+Today was supposed to be the start of stage 2 which is **Idempotency + Deduplication Engine**. But I thought it will be nice to manually stress test the existing logic. I introduced a python script for generating synthetic data following the known schema. I generate 1 Million records and then 10 Million record files and tried ingesting them.
+
+### Here are some records:
+
+**1 Million Records**
+```bash 
+go run main.go ingest --file=~/Projects/personal/concile/data/inflow_1M.jsonl
+
+Processed 271.60 MiB of data
+⏱️  Transaction Processor took 2.27s
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      999992
+Failed:         0
+Duplicates:     8
+Duration:       2.27s
+
+==============================
+```
+
+_CPU Profile for 1 Million Record_
+```bash
+go tool pprof cpu.prof
+File: main
+Type: cpu
+Time: 2026-03-07 13:46:42 WAT
+Duration: 2.42s, Total samples = 2.48s (102.62%)
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top
+Showing nodes accounting for 1910ms, 77.02% of 2480ms total
+Dropped 44 nodes (cum <= 12.40ms)
+Showing top 10 nodes out of 121
+      flat  flat%   sum%        cum   cum%
+     780ms 31.45% 31.45%     1800ms 72.58%  github.com/Varsilias/concile/internal/processor.Run
+     290ms 11.69% 43.15%      290ms 11.69%  runtime.madvise
+     220ms  8.87% 52.02%      250ms 10.08%  runtime.scanObject
+     190ms  7.66% 59.68%      230ms  9.27%  runtime.mapaccess2_faststr
+     150ms  6.05% 65.73%      150ms  6.05%  syscall.rawsyscalln
+      60ms  2.42% 68.15%       60ms  2.42%  runtime.memmove
+      60ms  2.42% 70.56%       70ms  2.82%  runtime.tryDeferToSpanScan
+      60ms  2.42% 72.98%       60ms  2.42%  runtime.usleep
+      50ms  2.02% 75.00%      110ms  4.44%  encoding/json.checkValid
+      50ms  2.02% 77.02%       50ms  2.02%  runtime.memclrNoHeapPointers
+(pprof)
+```
+
+**Explanation**
+From the *Ingestion Report*, we see that the timing report stays consistent. We had a median processing time for 100k records at `200+ms` which means that if we 10x our records, we also expect 10x time which is why we have `2+s`.
+The Profiler shows a different output though especially for Inflow Records. If you read the report for the day before today, you will see where we had 16 Bytes of allocation every time we call `Normalize` on an Inflow Record, it turns out that at scale, it becomes a bottle neck as proven by this 2 lines:
+```bash
+     290ms 11.69% 43.15%      290ms 11.69%  runtime.madvise
+     220ms  8.87% 52.02%      250ms 10.08%  runtime.scanObject
+```
+These are times used by the Garbage Collector to scan for Object that needs to be `removed(garbage collected)`. It was not very pronounced at 100k but when the number of records increase, then we awaken the GC. Also, our in-memory map for handling and detecting duplicate references also starts becoming a bottleneck at scale based on this line
+```bash
+     190ms  7.66% 59.68%      230ms  9.27%  runtime.mapaccess2_faststr
+```
+
+**10 Million Records**
+```bash
+Processed 2.65 GiB of data
+⏱️  Transaction Processor took 28.23s
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      9999574
+Failed:         0
+Duplicates:     426
+Duration:       28.23s
+
+==============================
+```
+
+_CPU Profile for 10 Million Record_
+```bash
+go tool pprof cpu.prof
+File: main
+Type: cpu
+Time: 2026-03-07 13:51:09 WAT
+Duration: 28.40s, Total samples = 35.92s (126.49%)
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top
+Showing nodes accounting for 29290ms, 81.54% of 35920ms total
+Dropped 151 nodes (cum <= 179.60ms)
+Showing top 10 nodes out of 91
+      flat  flat%   sum%        cum   cum%
+    5380ms 14.98% 14.98%    21730ms 60.50%  github.com/Varsilias/concile/internal/processor.Run
+    5350ms 14.89% 29.87%     8990ms 25.03%  runtime.scanObject
+    3650ms 10.16% 40.03%     3670ms 10.22%  runtime.tryDeferToSpanScan
+    3530ms  9.83% 49.86%     3530ms  9.83%  runtime.memclrNoHeapPointers
+    3120ms  8.69% 58.55%     3120ms  8.69%  runtime.madvise
+    2380ms  6.63% 65.17%     4780ms 13.31%  runtime.mapaccess2_faststr
+    2380ms  6.63% 71.80%     2380ms  6.63%  runtime.memequal
+    1520ms  4.23% 76.03%     1520ms  4.23%  runtime.usleep
+    1120ms  3.12% 79.15%     1120ms  3.12%  runtime.memmove
+     860ms  2.39% 81.54%      860ms  2.39%  runtime.(*spanInlineMarkBits).init
+(pprof) 
+```
+
+## Stage 2
+For this stage, the goal is to add a more robust `idempotency check`. **Stage 1** used an in-memory map alone to track duplicate items which mean we have to reprocess records again for every time we ingest a file.
+### The Implemetation
+The current implementation borrows from the idea that powers most popular storage engines. we track in-memory and flush to disk at intervals just like WAL(Write Ahead Logs) in Postgres and LSM-Trees. But my implementation for now does not include periodic flush to disk, instead we write to disk immediately we `Normalize` a record. We still maintain an `in-memory` map for quick lookup to check if a normalised record is a duplicate item. But once the ingestion finishes, the in-memory object is thrown away which is safe to do because we are also append to a `wal.log` file as we process.
+
+Now, when a new ingestion command runs, we rebuild the in-memory object from the durable `wal.log` file, that way, every `ingest` command stays idempotent
+
+#### Performance Consideration
+1. Appending to file immediately after processing - for this, there was no peformance bottleneck and this is because we are perfoming sequential writes and not random writes
+2. We are currently using 1 large file for WAL, what happens when we append `100M` keys - well I have not benchmarked `100M` keys yet but I have already seen some numbers for replay time alone and it is not looking good as data grows. I may have to introduce some encoding to make things smaller
+3. What does startup time look like especially as log file grows - right now, it grows linearly as he file grows
+
+**Some Numbers**
+
+_For 100K Records_
+
+**_Empty Log File_**
+```bash
+⏱️  WAL Replay took 90.292µs
+
+========================================
+       WAL REPLAY REPORT       
+========================================
+Started At:     2026-03-07T19:27:00.406+01:00
+Ended At:       2026-03-07T19:27:00.406+01:00
+Duration:       200.416µs
+
+========================================
+Processed 27.16 MiB of data
+⏱️  Transaction Processor took 297.252333ms
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      100000
+Failed:         0
+Duplicates:     0
+Duration:       297.256417ms
+
+==============================
+```
+
+**_After first run_**
+
+```bash
+⏱️  WAL Replay took 6.817459ms
+
+========================================
+       WAL REPLAY REPORT       
+========================================
+Started At:     2026-03-07T19:27:10.797+01:00
+Ended At:       2026-03-07T19:27:10.804+01:00
+Duration:       6.826958ms
+
+========================================
+Processed 27.16 MiB of data
+⏱️  Transaction Processor took 193.783334ms
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      0
+Failed:         0
+Duplicates:     100000
+Duration:       193.786083ms
+
+==============================
+```
+
+You can see that replay time increases as number of records in log increases. Imagine what it will look like for `1M,10M,100M` records.
+
+I also simulated a crash and everything worked really well
+```bash
+go run main.go ingest --file=~/Projects/personal/concile/data/inflow_1M.jsonl --provider=Vbank
+^Csignal: interrupt
+```
+And the next run gave this
+
+```bash
+ go run main.go ingest --file=~/Projects/personal/concile/data/inflow_1M.jsonl --provider=Vbank
+Processed 271.60 MiB of data
+⏱️  Transaction Processor took 2.93s
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      795188
+Failed:         0
+Duplicates:     204812
+Duration:       2.93s
+
+==============================
+```
+I pushed the ingestation pipeline to the limit with `100M` records which is about **28.48GB**, got to about `2.4GB` of log file but I had to kill the process half way.
+
+If each key is about:
+```bash
+30 digits + newline ≈ 31 bytes
+```
+Then:
+```bash
+2.39GB / 31 ≈ ~77 million entries
+```
+Which means your run probably reached around:
+```
+~75–80M transactions
+```
+before I killed it.

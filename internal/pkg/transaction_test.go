@@ -15,8 +15,10 @@ func BenchmarkNormalizeInflow(b *testing.B) {
 		Wallet:        "Zpay",
 	}
 
+	sourceBank := "vbank"
+
 	for b.Loop() {
-		_, _ = Normalize(raw)
+		_, _ = Normalize(raw, sourceBank)
 	}
 }
 
@@ -31,7 +33,9 @@ func BenchmarkNormalizeOutflow(b *testing.B) {
 		ResponseCode:  "00",
 	}
 
+	sourceBank := "providus"
+
 	for b.Loop() {
-		_, _ = Normalize(raw)
+		_, _ = Normalize(raw, sourceBank)
 	}
 }

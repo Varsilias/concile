@@ -9,6 +9,10 @@ import (
 	"github.com/Varsilias/concile/internal/pkg"
 )
 
+// timeFormatRFC3339Milli defines the layout for RFC3339 with millisecond precision.
+// The "000" after the seconds represents milliseconds (3 decimal places).
+const timeFormatRFC3339Milli = "2006-01-02T15:04:05.000Z07:00"
+
 type IngestionStats struct {
 	stats pkg.Stats
 	mu    sync.Mutex

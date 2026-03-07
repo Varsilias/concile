@@ -31,15 +31,16 @@ type RawTransaction struct {
 }
 
 type CanonicalTransaction struct {
+	Timestamp   time.Time
 	Reference   string
 	FromAccount string
 	ToAccount   string
 	FromBank    string
 	SessionID   string
-	Timestamp   time.Time
-	AmountMinor int64
+	SourceBank  string
 	Currency    string
 	Type        TransactionType
+	AmountMinor int64
 }
 
 // OUTFLOW SCHEMA EXAMPLE DATA
@@ -66,7 +67,7 @@ type CanonicalTransaction struct {
 // 	"Wallet Name":"Zpay"
 // }
 
-func Normalize(rawTrx RawTransaction) (CanonicalTransaction, error) {
+func Normalize(rawTrx RawTransaction, sourceBank string) (CanonicalTransaction, error) {
 	var nilTrx CanonicalTransaction
 	trim := strings.TrimSpace
 	// validate required fields
@@ -117,5 +118,18 @@ func Normalize(rawTrx RawTransaction) (CanonicalTransaction, error) {
 		AmountMinor: int64(amountMinor),
 		Currency:    rawTrx.Currency,
 		Type:        TransactionType(rawTrx.Type),
+		SourceBank:  sourceBank,
 	}, nil
+}
+
+func IdempotencyKey(trx CanonicalTransaction) string {
+	if trx.SessionID != "" {
+		return trx.SessionID
+	}
+	var sb strings.Builder
+	sb.WriteString(trx.SourceBank)
+	sb.WriteString(":")
+	sb.WriteString(trx.Reference)
+
+	return sb.String()
 }
