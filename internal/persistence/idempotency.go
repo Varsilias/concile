@@ -2,9 +2,10 @@ package persistence
 
 import (
 	"bufio"
-	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -20,7 +21,7 @@ type IdempotencyStore interface {
 // MemoryStore holds the keys that have been
 // processed so far in the ingested file
 type MemoryStore struct {
-	seen map[string]struct{}
+	seen map[uint64]struct{}
 	wal  *WAL
 }
 
@@ -29,7 +30,7 @@ func NewMemoryStore(enableWAL bool) (IdempotencyStore, error) {
 	defer tl.Finish()
 	defer telemetry.Track("WAL Replay")()
 
-	seen := map[string]struct{}{}
+	seen := map[uint64]struct{}{}
 	store := &MemoryStore{}
 	store.seen = seen
 
@@ -47,19 +48,37 @@ func NewMemoryStore(enableWAL bool) (IdempotencyStore, error) {
 }
 
 func (ms *MemoryStore) Seen(key string) bool {
-	_, ok := ms.seen[key]
+	var hashSum uint64
+
+	if ms.wal != nil {
+		hashSum = ms.wal.HashKeyToUint64(key)
+	} else {
+		h := fnv.New64a()
+		h.Write([]byte(key))
+		hashSum = h.Sum64()
+	}
+
+	_, ok := ms.seen[hashSum]
 	return ok
 }
 
 // Record writes to durable log and then updates in-memory map
 func (ms *MemoryStore) Record(key string) error {
+	var hashSum uint64
+
 	if ms.wal != nil { // check this because the WAL may not be enabled
 		err := ms.wal.Append(key)
 		if err != nil {
 			return err
 		}
+		hashSum = ms.wal.HashKeyToUint64(key)
+	} else {
+		h := fnv.New64a()
+		h.Write([]byte(key))
+		hashSum = h.Sum64()
 	}
-	ms.seen[key] = struct{}{}
+
+	ms.seen[hashSum] = struct{}{}
 	return nil
 }
 
@@ -85,17 +104,11 @@ func (ms *MemoryStore) rebuild() error {
 		if err != nil {
 			return err
 		}
-		buffer := bufio.NewReaderSize(f, 1<<20)
+		reader := bufio.NewReaderSize(f, 1<<20)
+		buffer := make([]byte, 8)
 		for {
-			key, err := buffer.ReadSlice('\n')
+			_, err := io.ReadFull(reader, buffer)
 
-			if len(key) > 0 {
-				line := bytes.TrimRight(key, "\r\n")
-				if len(line) > 0 {
-					ms.seen[string(line)] = struct{}{}
-
-				}
-			}
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					break
@@ -103,6 +116,9 @@ func (ms *MemoryStore) rebuild() error {
 				f.Close()
 				return err
 			}
+			id := binary.BigEndian.Uint64(buffer)
+			ms.seen[id] = struct{}{}
+
 		}
 		f.Close()
 	}

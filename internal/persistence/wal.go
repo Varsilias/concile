@@ -1,7 +1,9 @@
 package persistence
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -51,10 +53,22 @@ func (wal *WAL) DataDir() string {
 }
 
 func (wal *WAL) Append(key string) error {
-	_, err := wal.file.Write([]byte(key + "\n")) // TODO: handle error if necessary
+	hashSum := wal.HashKeyToUint64(key)
+
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, hashSum) // encode the hash into a compact 8 byte for easy storage
+
+	_, err := wal.file.Write(buf) // TODO: handle error if necessary
 	return err
 }
 
 func (wal *WAL) Flush() error {
 	return wal.file.Close()
+}
+
+// HashKeyToUint64 produces an unsigned 64-bit compatible hash from a given string key
+func (wal *WAL) HashKeyToUint64(key string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(key))
+	return h.Sum64()
 }

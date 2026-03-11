@@ -1,5 +1,5 @@
 # Day 1 - 25th February, 2026
-Most of today was spent learning how `flag.FlagSet` from the **flag** package works because, implementing a nice reusable command registration hook. I wanted to have the `subcommand` experience that most Go CLI tools have without using the popular `pflag` package.
+Most of today was spent learning how `flag.FlagSet` from the **flag** package works because, implementing a nice reusable command registration hook. I wanted to have the `subcommand` experience most Go CLI tools have without using the popular `pflag` package.
 
 I also ended up wiring up a command to convert `xlsx` file into `jsonl`
 
@@ -16,7 +16,7 @@ For Duplicate handling, I have chosen to
 - Record the number of duplicates as encountered during processing for statistics
 
 ## Performance Considerations
-There are plenty that I already forsee but I would not want to get involved in premature optimisation until I start benchmarking operations, besides I have not implemented the main file processing.
+There are plenty that I already forsee but I would not want to get involved in premature optimisation until I start benchmarking operations, besides I have not implemented the main file processing logic.
 
 
 Here are some performance considerations to think of
@@ -410,8 +410,177 @@ Then:
 ```bash
 2.39GB / 31 ≈ ~77 million entries
 ```
-Which means your run probably reached around:
+Which means my run probably reached around:
 ```
 ~75–80M transactions
 ```
 before I killed it.
+# Day 5 - 11th March
+Started today by implemeting something I thought about skipping but my mind could not go off it.
+The WAl file stores `Reference IDs` as strings plus an extra `newline("\n")` character. So far wwe have seen the `SessionID` of transaction records to be the most unique key for detecting duplicate and each SessionID is a string that `30-bytes` long including the newline character we have `31-bytes` per transaction record.
+For 10 Million Transaction Records, assuming the entire record has a unique Session ID, that givies us
+```bash
+10 Million Record * 31 bytes = 310 Million Bytes ≈ 300MB WAL Log file
+```
+## The Solution
+I converted every SessionID string into a fixed `8-byte` binary encoding representation. Before that, you need to know that you cannot straight up convert a **string** to **binary**, I had to convert the string to and unsigned 64 bit compatible integer and then converted that to 8-byte binary.
+With the new implementation, for 10 Million Records, we should then have
+```bash
+10 Million Record * 8 bytes = 80 Million Bytes ≈ 80MB WAL Log file
+```
+Percentage difference
+```bash
+310/80 * 100%
+```
+We gain approximately 80% disk space back which can be used to store something else. The best part, we do all this without reducing performance. Infact, after some profiling, we gained in speed.
+Here are some numbers:
+_For 1 Million records we are roughly at the same speed(3s) as before when no duplicates were detected_
+```bash
+⏱️  WAL Replay took 1.077167ms
+
+==================================================
+       WAL REPLAY REPORT       
+==================================================
+Started At:     2026-03-11T13:14:12.397+01:00
+Ended At:       2026-03-11T13:14:12.399+01:00
+Duration:       1.127583ms
+
+==================================================
+Processed 271.61 MiB of data
+⏱️  Transaction Processor took 3s
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      1000000
+Failed:         0
+Duplicates:     0
+Duration:       3s
+
+==============================
+
+```
+
+But for duplicates and rebuilding the log before processing, we hover between `60` & `80` milliseconds for replay time but we are consistently below `2s` in processing time
+```bash
+⏱️  WAL Replay took 83.783334ms
+
+==================================================
+       WAL REPLAY REPORT       
+==================================================
+Started At:     2026-03-11T13:15:13.909+01:00
+Ended At:       2026-03-11T13:15:13.993+01:00
+Duration:       83.8ms
+
+==================================================
+Processed 271.61 MiB of data
+⏱️  Transaction Processor took 1.99s
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      0
+Failed:         0
+Duplicates:     1000000
+Duration:       1.99s
+
+==============================
+
+
+⏱️  WAL Replay took 61.834333ms
+
+==================================================
+       WAL REPLAY REPORT       
+==================================================
+Started At:     2026-03-11T13:15:27.365+01:00
+Ended At:       2026-03-11T13:15:27.427+01:00
+Duration:       61.853042ms
+
+==================================================
+Processed 271.61 MiB of data
+⏱️  Transaction Processor took 1.98s
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      0
+Failed:         0
+Duplicates:     1000000
+Duration:       1.98s
+
+==============================
+```
+I also did some **CPU** and **Memory** Profiling
+
+### Memory Profile
+```bash
+go tool pprof mem.prof
+File: main
+Type: inuse_space
+Time: 2026-03-11 13:36:36 WAT
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top
+Showing nodes accounting for 2722.32kB, 100% of 2722.32kB total
+Showing top 10 nodes out of 16
+      flat  flat%   sum%        cum   cum%
+ 1184.27kB 43.50% 43.50%  1184.27kB 43.50%  runtime/pprof.StartCPUProfile
+    1026kB 37.69% 81.19%     1026kB 37.69%  runtime.mallocgc
+  512.05kB 18.81%   100%   512.05kB 18.81%  time.Sleep
+         0     0%   100%  1184.27kB 43.50%  main.main
+         0     0%   100%     1026kB 37.69%  runtime.allocm
+         0     0%   100%  1184.27kB 43.50%  runtime.main
+         0     0%   100%     1026kB 37.69%  runtime.mstart
+         0     0%   100%     1026kB 37.69%  runtime.mstart0
+         0     0%   100%     1026kB 37.69%  runtime.mstart1
+         0     0%   100%     1026kB 37.69%  runtime.newm
+```
+
+### CPU Profile
+```bash
+go tool pprof cpu.prof
+File: main
+Type: cpu
+Time: 2026-03-11 13:40:49 WAT
+Duration: 21.71s, Total samples = 19.42s (89.47%)
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top
+Showing nodes accounting for 12930ms, 66.58% of 19420ms total
+Dropped 162 nodes (cum <= 97.10ms)
+Showing top 10 nodes out of 101
+      flat  flat%   sum%        cum   cum%
+    3560ms 18.33% 18.33%     3560ms 18.33%  syscall.rawsyscalln
+    2330ms 12.00% 30.33%     2420ms 12.46%  runtime.mapaccess2_fast64
+    1920ms  9.89% 40.22%     1920ms  9.89%  encoding/json.stateInString
+    1100ms  5.66% 45.88%     3340ms 17.20%  encoding/json.checkValid
+    1000ms  5.15% 51.03%     1200ms  6.18%  encoding/json.unquoteBytes
+     930ms  4.79% 55.82%      930ms  4.79%  runtime.madvise
+     730ms  3.76% 59.58%      790ms  4.07%  encoding/json.(*decodeState).rescanLiteral
+     530ms  2.73% 62.31%      530ms  2.73%  runtime.pthread_cond_signal
+     430ms  2.21% 64.52%      430ms  2.21%  runtime.memclrNoHeapPointers
+     400ms  2.06% 66.58%      750ms  3.86%  runtime.mapassign_fast64
+```
+
+The Profiling data tells us something very important.
+
+The Top CPU Consumers are
+```bash
+18% syscall.rawsyscalln 
+12% runtime.mapaccess2_fast64
+9% encoding/json.stateInString
+5% encoding/json.checkValid
+5% encoding/json.unquoteBytes
+```
+
+`Concile` is spending more time in exactly **three places:**
+1. disk IO - syscall.rawsyscalln
+2. map operations - runtime.mapaccess2_fast64(this used to be runtime.mapaccess2_faststr)
+3. JSON parsing - encoding/json.*
+
+Memory shows that for 10 Million records with 8MB of existing WAL file, we use a total of
+```bash
+  ~2.7MB
+```
+Which is ridiculously small and the biggest consumer is not even my code logic itself, it is the code snippet that collect CPU profiling data
+```bash
+runtime/pprof.StartCPUProfile
+```

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"runtime/pprof"
 
 	"github.com/Varsilias/concile/internal/command"
@@ -14,6 +15,11 @@ func main() {
 	f, _ := os.Create("cpu.prof")
 	pprof.StartCPUProfile(f)
 	defer pprof.StopCPUProfile()
+
+	mf, _ := os.Create("mem.prof")
+	defer mf.Close()
+	runtime.GC()
+	pprof.WriteHeapProfile(mf)
 
 	command.Register("help", "Show CLI usage",
 		func(fs *flag.FlagSet, values map[string]*string) {
