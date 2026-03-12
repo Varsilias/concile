@@ -584,3 +584,134 @@ Which is ridiculously small and the biggest consumer is not even my code logic i
 ```bash
 runtime/pprof.StartCPUProfile
 ```
+
+# Day 6 - 12th March
+Yesterday as part of the binary state representation implementation, I also wrote a first-pass implementation for the concurrent processing of data we ingest. The idea is to introduce concurrency via a CLI flag `--workers` and with that we configure how many goroutines we will spin up and then concurrently process the file.
+My first implementation turned out to be slower than sequential processing even though we ran about **10 goroutines**. You might ask qhy I started my test with 10. It is because the `--worker` flag is optional and defaults to the number of CPUs present in the host machine and mine is a 10-core Apple Macbook Air.
+The sequential processing on 10 million records took around **25-30** seconds but my first pass implementation took **55 second** on 10 goroutines to process the same 10 million records which is God awful for a concurrent processing system that should actually speed things up.
+Just like I have been doing all this while, I implement, test, collect metrics and observe to see what the issues my be.
+### Here are some of my observations
+1. **Memory Stayed the same:** the same 2.7MB
+```bash
+File: main
+Type: inuse_space
+Time: 2026-03-11 17:43:18 WAT
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top
+Showing nodes accounting for 2754.02kB, 100% of 2754.02kB total
+Showing top 10 nodes out of 20
+      flat  flat%   sum%        cum   cum%
+ 1184.27kB 43.00% 43.00%  1184.27kB 43.00%  runtime/pprof.StartCPUProfile
+  544.67kB 19.78% 62.78%   544.67kB 19.78%  github.com/xuri/excelize/v2.init
+     513kB 18.63% 81.41%      513kB 18.63%  runtime.mallocgc
+  512.08kB 18.59%   100%   512.08kB 18.59%  compress/gzip.NewWriterLevel
+         0     0%   100%  1184.27kB 43.00%  main.main
+         0     0%   100%      513kB 18.63%  runtime.allocm
+         0     0%   100%   544.67kB 19.78%  runtime.doInit (inline)
+         0     0%   100%   544.67kB 19.78%  runtime.doInit1
+         0     0%   100%  1728.94kB 62.78%  runtime.main
+         0     0%   100%      513kB 18.63%  runtime.mstart
+```
+2. **CPU Time increased significantly:** I saw over 60% increase from dominated mainly by waiting time.
+The dominant factor before concurrent processing was `syscalls` as shown here
+```bash
+File: main
+Type: cpu
+Time: 2026-03-11 13:40:49 WAT
+Duration: 21.71s, Total samples = 19.42s (89.47%)
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top
+Showing nodes accounting for 12930ms, 66.58% of 19420ms total
+Dropped 162 nodes (cum <= 97.10ms)
+Showing top 10 nodes out of 101
+      flat  flat%   sum%        cum   cum%
+    3560ms 18.33% 18.33%     3560ms 18.33%  syscall.rawsyscalln
+    2330ms 12.00% 30.33%     2420ms 12.46%  runtime.mapaccess2_fast64
+    1920ms  9.89% 40.22%     1920ms  9.89%  encoding/json.stateInString
+    1100ms  5.66% 45.88%     3340ms 17.20%  encoding/json.checkValid
+    1000ms  5.15% 51.03%     1200ms  6.18%  encoding/json.unquoteBytes
+     930ms  4.79% 55.82%      930ms  4.79%  runtime.madvise
+     730ms  3.76% 59.58%      790ms  4.07%  encoding/json.(*decodeState).rescanLiteral
+     530ms  2.73% 62.31%      530ms  2.73%  runtime.pthread_cond_signal
+     430ms  2.21% 64.52%      430ms  2.21%  runtime.memclrNoHeapPointers
+     400ms  2.06% 66.58%      750ms  3.86%  runtime.mapassign_fast64
+```
+It became threading and sleep signals after concurrent implementation.
+```bash
+File: main
+Type: cpu
+Time: 2026-03-11 17:43:18 WAT
+Duration: 55.23s, Total samples = 87.30s (158.08%)
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top
+Showing nodes accounting for 86.06s, 98.58% of 87.30s total
+Dropped 135 nodes (cum <= 0.44s)
+Showing top 10 nodes out of 44
+      flat  flat%   sum%        cum   cum%
+    46.80s 53.61% 53.61%     46.80s 53.61%  runtime.pthread_cond_wait
+    27.72s 31.75% 85.36%     27.72s 31.75%  syscall.rawsyscalln
+     7.36s  8.43% 93.79%      7.36s  8.43%  runtime.pthread_cond_signal
+     4.13s  4.73% 98.52%      4.13s  4.73%  runtime.usleep
+     0.01s 0.011% 98.53%     27.45s 31.44%  internal/poll.(*FD).Write
+     0.01s 0.011% 98.55%     46.82s 53.63%  runtime.notesleep
+     0.01s 0.011% 98.56%     46.81s 53.62%  runtime.semasleep
+     0.01s 0.011% 98.57%      3.52s  4.03%  runtime.stealWork
+     0.01s 0.011% 98.58%      4.49s  5.14%  runtime.systemstack
+         0     0% 98.58%     27.55s 31.56%  github.com/Varsilias/concile/internal/persistence.(*MemoryStore).Record
+```
+There was also significant time spend on access our im-memory map, and I guess that because our workers were so fast due to them doing very little work, they spend most of their time contending to access the in-memory map which is guarded by a `sync.Mutex`.
+
+3. **The Workers Performed Very Little Tasks:** the data that shows the actual bottleneck is my manual telemetry tracking. I logged the capacity of the channel every *2 seconds* so I could see what is going on inside the queue. My implementation at this point uses one channel shared by all workers. The data shows that the workers were finishing tasks so fast that there was barely ever any data inside the channel whenever it logged. Essentially, my implementation introduced a negative backpressure and that cause workers to spend more time either *"waiting"* or *"sleeping"*.
+```bash
+worker count not set, defaulting to total number of CPU cores present 10
+⏱️  WAL Replay took 715.916µs
+
+==================================================
+       WAL REPLAY REPORT       
+==================================================
+Started At:     2026-03-11T17:43:18.076+01:00
+Ended At:       2026-03-11T17:43:18.077+01:00
+Duration:       736.083µs
+
+==================================================
+2026/03/11 17:43:20 Current Backlog: 0/10000
+2026/03/11 17:43:22 Current Backlog: 0/10000
+2026/03/11 17:43:24 Current Backlog: 0/10000
+2026/03/11 17:43:26 Current Backlog: 0/10000
+2026/03/11 17:43:28 Current Backlog: 0/10000
+2026/03/11 17:43:30 Current Backlog: 0/10000
+2026/03/11 17:43:32 Current Backlog: 0/10000
+2026/03/11 17:43:34 Current Backlog: 0/10000
+2026/03/11 17:43:36 Current Backlog: 0/10000
+2026/03/11 17:43:38 Current Backlog: 0/10000
+2026/03/11 17:43:40 Current Backlog: 0/10000
+2026/03/11 17:43:42 Current Backlog: 0/10000
+2026/03/11 17:43:44 Current Backlog: 0/10000
+2026/03/11 17:43:46 Current Backlog: 0/10000
+2026/03/11 17:43:48 Current Backlog: 0/10000
+2026/03/11 17:43:50 Current Backlog: 0/10000
+2026/03/11 17:43:52 Current Backlog: 0/10000
+2026/03/11 17:43:54 Current Backlog: 0/10000
+2026/03/11 17:43:56 Current Backlog: 0/10000
+2026/03/11 17:43:58 Current Backlog: 0/10000
+2026/03/11 17:44:00 Current Backlog: 0/10000
+2026/03/11 17:44:02 Current Backlog: 0/10000
+2026/03/11 17:44:04 Current Backlog: 0/10000
+2026/03/11 17:44:06 Current Backlog: 0/10000
+2026/03/11 17:44:08 Current Backlog: 0/10000
+2026/03/11 17:44:10 Current Backlog: 0/10000
+2026/03/11 17:44:12 Current Backlog: 0/10000
+Processed 2.65 GiB of data
+⏱️  Transaction Processor took 55.1s
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      10000000
+Failed:         0
+Duplicates:     0
+Duration:       55.1s
+
+==============================
+```
+The next time I hop on, I will implement a few optimisation plans I have

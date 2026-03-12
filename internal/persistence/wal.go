@@ -7,12 +7,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 type WAL struct {
 	dataDir  string
 	filename string
 	file     io.ReadWriteCloser
+	mu       sync.Mutex
 }
 
 func NewWAL() (*WAL, error) {
@@ -27,14 +29,16 @@ func NewWAL() (*WAL, error) {
 	}
 
 	wal := &WAL{
-		dataDir: dataDir,
-		// filename: fmt.Sprintf("wal_%d.log", time.Now().UnixNano()),
+		dataDir:  dataDir,
 		filename: "wal.log",
 	}
 	return wal, nil
 }
 
 func (wal *WAL) CreateLogFile() error {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+
 	path := filepath.Join(wal.dataDir, wal.filename)
 
 	flag := os.O_CREATE | os.O_APPEND | os.O_RDWR // we need read/write permission because, we need to append to log file and read when replaying the log
@@ -49,10 +53,16 @@ func (wal *WAL) CreateLogFile() error {
 }
 
 func (wal *WAL) DataDir() string {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+
 	return wal.dataDir
 }
 
 func (wal *WAL) Append(key string) error {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+
 	hashSum := wal.HashKeyToUint64(key)
 
 	buf := make([]byte, 8)
@@ -63,6 +73,9 @@ func (wal *WAL) Append(key string) error {
 }
 
 func (wal *WAL) Flush() error {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+
 	return wal.file.Close()
 }
 

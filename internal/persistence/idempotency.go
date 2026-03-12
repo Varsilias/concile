@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/Varsilias/concile/internal/telemetry"
 )
@@ -16,6 +17,7 @@ import (
 type IdempotencyStore interface {
 	Seen(key string) bool
 	Record(key string) error
+	Flush() error
 }
 
 // MemoryStore holds the keys that have been
@@ -23,6 +25,7 @@ type IdempotencyStore interface {
 type MemoryStore struct {
 	seen map[uint64]struct{}
 	wal  *WAL
+	mu   sync.Mutex
 }
 
 func NewMemoryStore(enableWAL bool) (IdempotencyStore, error) {
@@ -48,6 +51,9 @@ func NewMemoryStore(enableWAL bool) (IdempotencyStore, error) {
 }
 
 func (ms *MemoryStore) Seen(key string) bool {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
 	var hashSum uint64
 
 	if ms.wal != nil {
@@ -64,6 +70,9 @@ func (ms *MemoryStore) Seen(key string) bool {
 
 // Record writes to durable log and then updates in-memory map
 func (ms *MemoryStore) Record(key string) error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
 	var hashSum uint64
 
 	if ms.wal != nil { // check this because the WAL may not be enabled
@@ -82,8 +91,19 @@ func (ms *MemoryStore) Record(key string) error {
 	return nil
 }
 
-func (ms *MemoryStore) rebuild() error {
+func (ms *MemoryStore) Flush() error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
 
+	if ms.wal == nil {
+		return nil
+	}
+	return ms.wal.Flush()
+}
+
+func (ms *MemoryStore) rebuild() error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
 	dataDir := ms.wal.DataDir()
 
 	entries, err := os.ReadDir(dataDir)

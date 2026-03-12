@@ -2,6 +2,7 @@ package processor
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -9,7 +10,12 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
+	"runtime"
 	"strconv"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/Varsilias/concile/internal/command"
 	"github.com/Varsilias/concile/internal/persistence"
@@ -24,6 +30,7 @@ func init() {
 			values["file"] = fs.String("file", "", "JSONL file path")
 			values["provider"] = fs.String("provider", "", "case insensitive name of the partner bank(Vbank, Globus, Providus)")
 			values["enable-wal"] = fs.String("enable-wal", "true", "enable WAL for idempotency check")
+			values["workers"] = fs.String("workers", "", "Number of concurrent processes to spin up to enable parallel processing")
 		},
 		func(args []string, values map[string]*string) error {
 			path := *values["file"]
@@ -41,19 +48,59 @@ func init() {
 			walEnabled, err := strconv.ParseBool(enableWal)
 			if err != nil {
 				return fmt.Errorf(`invalid value provided, enable-wal can be either "true" or "false"`)
-
 			}
-			return Run(path, provider, walEnabled)
+			workers := runtime.NumCPU()
+			workerVal := *values["workers"]
+
+			if workerVal != "" {
+				workers, err = strconv.Atoi(workerVal)
+				if err != nil {
+					return fmt.Errorf("invalid value provided for worker count, --worker should be set to number >= 1")
+				}
+			} else {
+				fmt.Println("worker count not set, defaulting to total number of CPU cores present", runtime.NumCPU())
+			}
+
+			return Run(path, provider, walEnabled, workers)
 		},
 	)
 }
 
-func Run(filePath, partner string, enableWAL bool) error {
+func Run(filePath, partner string, enableWAL bool, workers int) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	stats := telemetry.New()
 	defer stats.Finish()
 	defer telemetry.Track("Transaction Processor")()
 
 	store, err := persistence.NewMemoryStore(enableWAL)
+	defer store.Flush()
+
+	done := make(chan struct{})
+
+	var wg sync.WaitGroup
+	jobs := make(chan pkg.CanonicalTransaction, workers*1000)
+	for range workers {
+		wg.Go(func() {
+			worker(jobs, store, stats) // backpressure is handled automatically in Golang due to the fact that channels also have built-in synchronisation
+		})
+	}
+
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				log.Printf("Current Backlog: %d/%d", len(jobs), cap(jobs))
+			case <-ctx.Done():
+				log.Printf("interrupt recieved, stopping monitor...")
+			case <-done:
+				return
+			}
+		}
+
+	}()
 
 	path, err := utils.ResolvePath(filePath) // we already handled empty filepath check
 	if err != nil {
@@ -71,37 +118,56 @@ func Run(filePath, partner string, enableWAL bool) error {
 	lineNumber := 0
 
 	for {
-		line, err := buffer.ReadSlice('\n') // Given our file structure and each line size, we will never hit [bufio.ErrBufferFull] error
-		if err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("corrupted file content: %v", err)
-		}
+		select {
+		case <-ctx.Done():
+			goto SHUTDOWN
+		default:
+			line, err := buffer.ReadSlice('\n') // Given our file structure and each line size, we will never hit [bufio.ErrBufferFull] error
 
-		if len(line) > 0 {
-			lineNumber++
-			size += len(line)
-			trx, recErr := reconcile(line, partner)
-			key := pkg.IdempotencyKey(trx)
-			seen := store.Seen(key)
-			if recErr != nil {
-				log.Printf("Failed processing line %d\n, reason %v", lineNumber, recErr)
-				stats.IncrFailed()
-			} else if seen {
-				stats.IncrDuplicates()
-			} else {
-				store.Record(key) // write to WAL and updates in-memory map
-				// TODO: Add actual processing logic
-				stats.IncrProcessed()
+			if len(line) > 0 {
+				lineNumber++
+				size += len(line)
+				trx, recErr := reconcile(line, partner)
+				if recErr != nil {
+					log.Printf("Failed processing line %d\n, reason %v", lineNumber, recErr)
+					stats.IncrFailed()
+				} else if key := pkg.IdempotencyKey(trx); store.Seen(key) {
+					stats.IncrDuplicates()
+				} else {
+					jobs <- trx // send clean ready to be processed data to channel
+				}
 			}
-		}
 
-		if errors.Is(err, io.EOF) { // means we have reached the end out the file
-			break
+			if errors.Is(err, io.EOF) { // means we have reached the end out the file
+				goto SHUTDOWN
+			}
+			if err != nil {
+				return fmt.Errorf("corrupted file content: %v", err)
+			}
 		}
 	}
 
+SHUTDOWN:
+	close(jobs)
+	wg.Wait()
+	close(done)
 	fmt.Printf("Processed %s of data\n", utils.Bytes(size))
-
 	return nil
+}
+
+func worker(jobs <-chan pkg.CanonicalTransaction, store persistence.IdempotencyStore, stats *telemetry.IngestionStats) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("worker panic: %v", r)
+		}
+	}()
+
+	for job := range jobs {
+		key := pkg.IdempotencyKey(job)
+		store.Record(key) // write to WAL and updates in-memory map
+		stats.IncrProcessed()
+
+	}
 }
 
 func reconcile(line []byte, sourceBank string) (pkg.CanonicalTransaction, error) {
