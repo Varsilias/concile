@@ -2,17 +2,22 @@ package persistence
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/Varsilias/concile/internal/telemetry"
 )
+
+const QueueSize = 4 * 1024 // 4KB
 
 type IdempotencyStore interface {
 	Seen(key string) bool
@@ -23,19 +28,22 @@ type IdempotencyStore interface {
 // MemoryStore holds the keys that have been
 // processed so far in the ingested file
 type MemoryStore struct {
-	seen map[uint64]struct{}
-	wal  *WAL
-	mu   sync.Mutex
+	seen  map[uint64]struct{}
+	wal   *WAL
+	mu    sync.Mutex
+	queue chan uint64
 }
 
-func NewMemoryStore(enableWAL bool) (IdempotencyStore, error) {
+func NewMemoryStore(ctx context.Context, enableWAL bool) (IdempotencyStore, error) {
 	tl := telemetry.NewReplayStats()
 	defer tl.Finish()
 	defer telemetry.Track("WAL Replay")()
 
 	seen := map[uint64]struct{}{}
+	queue := make(chan uint64, QueueSize)
 	store := &MemoryStore{}
 	store.seen = seen
+	store.queue = queue
 
 	if enableWAL {
 		wal, err := NewWAL()
@@ -45,6 +53,8 @@ func NewMemoryStore(enableWAL bool) (IdempotencyStore, error) {
 		wal.CreateLogFile()
 		store.wal = wal
 		store.rebuild()
+		go store.writer(ctx) // only enable if WAL is enabled
+
 	}
 
 	return store, nil
@@ -54,15 +64,7 @@ func (ms *MemoryStore) Seen(key string) bool {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
-	var hashSum uint64
-
-	if ms.wal != nil {
-		hashSum = ms.wal.HashKeyToUint64(key)
-	} else {
-		h := fnv.New64a()
-		h.Write([]byte(key))
-		hashSum = h.Sum64()
-	}
+	hashSum := ms.hashKeyToUint64(key)
 
 	_, ok := ms.seen[hashSum]
 	return ok
@@ -70,30 +72,16 @@ func (ms *MemoryStore) Seen(key string) bool {
 
 // Record writes to durable log and then updates in-memory map
 func (ms *MemoryStore) Record(key string) error {
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
+	hashSum := ms.hashKeyToUint64(key)
+	ms.queue <- hashSum // add to WAL Queue
 
-	var hashSum uint64
-
-	if ms.wal != nil { // check this because the WAL may not be enabled
-		err := ms.wal.Append(key)
-		if err != nil {
-			return err
-		}
-		hashSum = ms.wal.HashKeyToUint64(key)
-	} else {
-		h := fnv.New64a()
-		h.Write([]byte(key))
-		hashSum = h.Sum64()
-	}
-
-	ms.seen[hashSum] = struct{}{}
 	return nil
 }
 
 func (ms *MemoryStore) Flush() error {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
+	close(ms.queue)
 
 	if ms.wal == nil {
 		return nil
@@ -144,4 +132,53 @@ func (ms *MemoryStore) rebuild() error {
 	}
 
 	return nil
+}
+
+func (ms *MemoryStore) writer(ctx context.Context) {
+	var batch []uint64
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case item := <-ms.queue:
+			batch = append(batch, item)
+			if len(batch) >= QueueSize {
+				ms.flush(batch)
+				batch = batch[:0] // reset batch to zero
+			}
+		case <-ticker.C:
+			if len(batch) > 0 {
+				ms.flush(batch)
+				batch = batch[:0] // reset batch to zero
+			}
+		case <-ctx.Done():
+			if len(batch) > 0 {
+				ms.flush(batch)
+			}
+			log.Println("WAL Writer shutting down...")
+			return
+		}
+	}
+}
+
+func (ms *MemoryStore) flush(batch []uint64) error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
+	for _, b := range batch {
+		err := ms.wal.Append(b)
+		if err != nil {
+			return err
+		}
+		ms.seen[b] = struct{}{}
+	}
+	return nil
+}
+
+// hashKeyToUint64 produces an unsigned 64-bit compatible hash from a given string key
+func (ms *MemoryStore) hashKeyToUint64(key string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(key))
+	return h.Sum64()
 }

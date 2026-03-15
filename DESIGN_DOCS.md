@@ -715,3 +715,217 @@ Duration:       55.1s
 ==============================
 ```
 The next time I hop on, I will implement a few optimisation plans I have
+
+# Day 7 - 14th March
+## Part One: 
+Today I started implementing the optimisations I had in mind, starting with moving the logic for JSON encoding to the worker goroutines. Before today, the transformation was done in the main process and the transformed data is then sent to the channel. That implementation made my workers to starve and increased the time taken to process the data significantly.
+
+
+After my implementation, I realised that the JSON encoding logic was corrupted and because of that the data was no longer being encoded properly, after investagtion i realised that my problem was a **Data Race Problem** caused by using `ReadSlice("\n")` method from the `bufio` package. 
+
+It turned out the the underlying slice used in the method's implementation was always reused after each read which means that even though we passed the line that was read to the worker, because the speed of the worker and the main process are not the same, before the worker will wake up to process the line from the channel, the underlying slice would have either been overriden with newly read line either halfway or in full(mostly halfway), it cause the bytes to be corrupted and the JSON encoder could not recognise it as a valid JSON. I solved this by switching to `ReadBytes("\n") which gives the same effect but allocates and returns a new byte slice for each line read.
+After the first implementation, there wasn't much change in performance, I only saw a 5 seconds reduction in time spent doing work and the CPU profile looks almost the same even slightly elevated.
+## Part Two:
+From previous benchmark I noticed that these 2 lines were at the top of the performance bottleneck
+```bash
+    46.80s 53.61% 53.61%     46.80s 53.61%  runtime.pthread_cond_wait
+    27.72s 31.75% 85.36%     27.72s 31.75%  syscall.rawsyscalln
+```
+what does 2 lines mean is that much of the program is being dominated by `locks` which is placed on the in-memory map & `syscalls` when writing processed records keys to file. At the time were making `write` syscall for every 8 byte we want to write to file. After moving the major work(json dencoding) to the workers those 2 lines did not change much, this is the CPU profile after that
+```bash
+File: main
+Type: cpu
+Time: 2026-03-14 18:06:59 WAT
+Duration: 49.71s, Total samples = 88.70s (178.44%)
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top
+Showing nodes accounting for 87.93s, 99.13% of 88.70s total
+Dropped 137 nodes (cum <= 0.44s)
+Showing top 10 nodes out of 40
+      flat  flat%   sum%        cum   cum%
+    39.26s 44.26% 44.26%     39.26s 44.26%  runtime.pthread_cond_wait
+    36.01s 40.60% 84.86%     36.01s 40.60%  syscall.rawsyscalln
+     7.14s  8.05% 92.91%      7.14s  8.05%  runtime.usleep
+     5.47s  6.17% 99.08%      5.47s  6.17%  runtime.pthread_cond_signal
+     0.03s 0.034% 99.11%      6.66s  7.51%  runtime.stealWork
+     0.01s 0.011% 99.12%     36.09s 40.69%  github.com/Varsilias/concile/internal/processor.worker
+     0.01s 0.011% 99.13%      5.49s  6.19%  runtime.wakep
+         0     0% 99.13%     35.74s 40.29%  github.com/Varsilias/concile/internal/persistence.(*MemoryStore).Record
+         0     0% 99.13%     35.71s 40.26%  github.com/Varsilias/concile/internal/persistence.(*WAL).Append
+         0     0% 99.13%     36.09s 40.69%  github.com/Varsilias/concile/internal/processor.Run.func1
+```
+
+My next move was to implement a batch writes to the WAL file instead of writing every **8-byte** to file for each line processed. When the worker calls `store.Record()` I no longer append to WAL file and update the in-memory map in one go, that has been replaced by writing the record to channel. Then we run a background go routine that **flushes** the channel based on
+1. Size of the goroutine
+2. Time - set to ever 1 second for now
+3. When the process is cancelled
+This implementation reduced the time spent doing work drastically. We went from processing **10 Million** records in
+1. **30 seconds** sequentially on a single core
+2. **55 seconds** after first concurrent implementation
+3. **50 seconds** when work was moved to worker
+to procesing the same number of records anywhere between **7 seconds** and **22 seconds** on workers greater than **one**
+Sample benchmarks
+```bash
+go run main.go ingest --file=~/Projects/personal/concile/data/inflow_10M.jsonl --provider=Zbank --workers=2
+⏱️  WAL Replay took 181.542µs
+
+==================================================
+       WAL REPLAY REPORT       
+==================================================
+Started At:     2026-03-14T21:58:03.102+01:00
+Ended At:       2026-03-14T21:58:03.102+01:00
+Duration:       192.125µs
+
+==================================================
+2026/03/14 21:58:05 Current Backlog: 2000/2000
+2026/03/14 21:58:07 Current Backlog: 2000/2000
+2026/03/14 21:58:09 Current Backlog: 2000/2000
+2026/03/14 21:58:11 Current Backlog: 2000/2000
+2026/03/14 21:58:13 Current Backlog: 1994/2000
+2026/03/14 21:58:15 Current Backlog: 2000/2000
+2026/03/14 21:58:17 Current Backlog: 1991/2000
+2026/03/14 21:58:19 Current Backlog: 2000/2000
+2026/03/14 21:58:21 Current Backlog: 2000/2000
+2026/03/14 21:58:23 Current Backlog: 1991/2000
+2026/03/14 21:58:25 Current Backlog: 2000/2000
+Processed 2.65 GiB of data
+⏱️  Transaction Processor took 22.82s
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      10000000
+Failed:         0
+Duplicates:     0
+Duration:       22.82s
+
+==============================
+2026/03/14 21:58:25 WAL Writer shutting down...
+
+# Second run while WAL file exists
+go run main.go ingest --file=~/Projects/personal/concile/data/inflow_10M.jsonl --provider=Vbank --workers=2
+⏱️  WAL Replay took 1.14s
+
+==================================================
+       WAL REPLAY REPORT       
+==================================================
+Started At:     2026-03-14T21:58:38.078+01:00
+Ended At:       2026-03-14T21:58:39.214+01:00
+Duration:       1.14s
+
+==================================================
+2026/03/14 21:58:41 Current Backlog: 2000/2000
+2026/03/14 21:58:43 Current Backlog: 1998/2000
+2026/03/14 21:58:45 Current Backlog: 1999/2000
+2026/03/14 21:58:47 Current Backlog: 2000/2000
+2026/03/14 21:58:49 Current Backlog: 2000/2000
+Processed 2.65 GiB of data
+⏱️  Transaction Processor took 12.27s
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      2195
+Failed:         0
+Duplicates:     9997805
+Duration:       12.27s
+
+==============================
+2026/03/14 21:58:50 WAL Writer shutting down...
+
+# On 4 workers
+go run main.go ingest --file=~/Projects/personal/concile/data/inflow_10M.jsonl --provider=Vbank --workers=4
+⏱️  WAL Replay took 162.208µs
+
+==================================================
+       WAL REPLAY REPORT       
+==================================================
+Started At:     2026-03-14T21:59:19.777+01:00
+Ended At:       2026-03-14T21:59:19.777+01:00
+Duration:       192.958µs
+
+==================================================
+2026/03/14 21:59:21 Current Backlog: 4000/4000
+2026/03/14 21:59:23 Current Backlog: 4000/4000
+2026/03/14 21:59:25 Current Backlog: 4000/4000
+2026/03/14 21:59:27 Current Backlog: 3999/4000
+2026/03/14 21:59:29 Current Backlog: 4000/4000
+2026/03/14 21:59:31 Current Backlog: 4000/4000
+2026/03/14 21:59:33 Current Backlog: 4000/4000
+2026/03/14 21:59:35 Current Backlog: 4000/4000
+2026/03/14 21:59:37 Current Backlog: 4000/4000
+2026/03/14 21:59:39 Current Backlog: 4000/4000
+Processed 2.65 GiB of data
+⏱️  Transaction Processor took 20.49s
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      10000000
+Failed:         0
+Duplicates:     0
+Duration:       20.49s
+
+==============================
+2026/03/14 21:59:40 WAL Writer shutting down...
+
+# Second run on 4 workers
+go run main.go ingest --file=~/Projects/personal/concile/data/inflow_10M.jsonl --provider=Vbank --workers=4
+⏱️  WAL Replay took 1.19s
+
+==================================================
+       WAL REPLAY REPORT       
+==================================================
+Started At:     2026-03-14T21:59:45.860+01:00
+Ended At:       2026-03-14T21:59:47.051+01:00
+Duration:       1.19s
+
+==================================================
+2026/03/14 21:59:49 Current Backlog: 3971/4000
+2026/03/14 21:59:51 Current Backlog: 3882/4000
+2026/03/14 21:59:53 Current Backlog: 3951/4000
+Processed 2.65 GiB of data
+⏱️  Transaction Processor took 7.72s
+
+==============================
+       INGESTION REPORT       
+==============================
+Processed:      3770
+Failed:         0
+Duplicates:     9996230
+Duration:       7.72s
+
+==============================
+2026/03/14 21:59:53 WAL Writer shutting down...
+
+```
+If you look at those logs, you will notice that we traded a little bit of consistency based on this finding especially when there is an existing *WAL* file to rebuild in-memory map from. We expect that at least less than or equal to **1000 * worker_count** will be reprocessed if the file containing that record has been processed before but this is not much of an issue as we have a strong **idempotency** implementation.
+
+
+The CPU profile looks great too
+```bash
+File: main
+Type: cpu
+Time: 2026-03-14 21:59:45 WAT
+Duration: 7.91s, Total samples = 28.64s (361.85%)
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top 
+Showing nodes accounting for 26.53s, 92.63% of 28.64s total
+Dropped 141 nodes (cum <= 0.14s)
+Showing top 10 nodes out of 87
+      flat  flat%   sum%        cum   cum%
+    16.86s 58.87% 58.87%     16.86s 58.87%  runtime.usleep
+     4.16s 14.53% 73.39%      4.16s 14.53%  runtime.pthread_cond_wait
+     3.35s 11.70% 85.09%      3.35s 11.70%  runtime.pthread_cond_signal
+     0.72s  2.51% 87.60%      0.72s  2.51%  runtime.madvise
+     0.42s  1.47% 89.07%      0.81s  2.83%  runtime.mapassign_fast64
+     0.39s  1.36% 90.43%      0.39s  1.36%  syscall.rawsyscalln
+     0.22s  0.77% 91.20%      0.22s  0.77%  encoding/json.stateInString
+     0.15s  0.52% 91.72%      0.15s  0.52%  encoding/json.unquoteBytes
+     0.15s  0.52% 92.25%      0.15s  0.52%  runtime.memclrNoHeapPointers
+     0.11s  0.38% 92.63%      0.39s  1.36%  encoding/json.checkValid
+```
+You can see the *syscall* that is **syscall.rawsyscalln**  has reduced drastically and no longer a bottlenech due to the batch implementation.
+The current bottleneck which exists now is because of the locks used to prevent concurrent map access.
+I have an implementation in mind but need to reason about it.
+See you tomorrow

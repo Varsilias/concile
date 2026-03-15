@@ -73,16 +73,16 @@ func Run(filePath, partner string, enableWAL bool, workers int) error {
 	defer stats.Finish()
 	defer telemetry.Track("Transaction Processor")()
 
-	store, err := persistence.NewMemoryStore(enableWAL)
+	store, err := persistence.NewMemoryStore(ctx, enableWAL)
 	defer store.Flush()
 
 	done := make(chan struct{})
 
 	var wg sync.WaitGroup
-	jobs := make(chan pkg.CanonicalTransaction, workers*1000)
+	jobs := make(chan []byte, workers*1000)
 	for range workers {
 		wg.Go(func() {
-			worker(jobs, store, stats) // backpressure is handled automatically in Golang due to the fact that channels also have built-in synchronisation
+			worker(jobs, store, stats, partner) // backpressure is handled automatically in Golang due to the fact that channels also have built-in "Blocking mechanism"
 		})
 	}
 
@@ -115,27 +115,16 @@ func Run(filePath, partner string, enableWAL bool, workers int) error {
 
 	buffer := bufio.NewReaderSize(f, 1<<20)
 	size := 0
-	lineNumber := 0
 
 	for {
 		select {
 		case <-ctx.Done():
 			goto SHUTDOWN
 		default:
-			line, err := buffer.ReadSlice('\n') // Given our file structure and each line size, we will never hit [bufio.ErrBufferFull] error
-
+			line, err := buffer.ReadBytes('\n') // Given our file structure and each line size, we will never hit [bufio.ErrBufferFull] error
 			if len(line) > 0 {
-				lineNumber++
 				size += len(line)
-				trx, recErr := reconcile(line, partner)
-				if recErr != nil {
-					log.Printf("Failed processing line %d\n, reason %v", lineNumber, recErr)
-					stats.IncrFailed()
-				} else if key := pkg.IdempotencyKey(trx); store.Seen(key) {
-					stats.IncrDuplicates()
-				} else {
-					jobs <- trx // send clean ready to be processed data to channel
-				}
+				jobs <- line // send clean ready to be processed data to channel
 			}
 
 			if errors.Is(err, io.EOF) { // means we have reached the end out the file
@@ -155,17 +144,25 @@ SHUTDOWN:
 	return nil
 }
 
-func worker(jobs <-chan pkg.CanonicalTransaction, store persistence.IdempotencyStore, stats *telemetry.IngestionStats) {
+func worker(jobs <-chan []byte, store persistence.IdempotencyStore, stats *telemetry.IngestionStats, partner string) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("worker panic: %v", r)
 		}
 	}()
 
-	for job := range jobs {
-		key := pkg.IdempotencyKey(job)
-		store.Record(key) // write to WAL and updates in-memory map
-		stats.IncrProcessed()
+	for line := range jobs {
+		trx, recErr := reconcile(line, partner)
+		if recErr != nil {
+			log.Printf("Failed processing line, reason %v", recErr)
+			stats.IncrFailed()
+		} else if key := pkg.IdempotencyKey(trx); store.Seen(key) {
+			stats.IncrDuplicates()
+		} else {
+			key := pkg.IdempotencyKey(trx)
+			store.Record(key) // write to WAL and updates in-memory map
+			stats.IncrProcessed()
+		}
 
 	}
 }
