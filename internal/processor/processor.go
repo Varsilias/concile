@@ -74,7 +74,6 @@ func Run(filePath, partner string, enableWAL bool, workers int) error {
 	defer telemetry.Track("Transaction Processor")()
 
 	store, err := persistence.NewMemoryStore(ctx, enableWAL)
-	defer store.Flush()
 
 	done := make(chan struct{})
 
@@ -87,7 +86,7 @@ func Run(filePath, partner string, enableWAL bool, workers int) error {
 	}
 
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(5 * time.Second) // reduce logging frequency for now, in future we can add support for verbose logging probably make it a global config
 		defer ticker.Stop()
 		for {
 			select {

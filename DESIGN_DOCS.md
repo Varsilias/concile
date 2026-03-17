@@ -929,3 +929,85 @@ You can see the *syscall* that is **syscall.rawsyscalln**  has reduced drastical
 The current bottleneck which exists now is because of the locks used to prevent concurrent map access.
 I have an implementation in mind but need to reason about it.
 See you tomorrow
+# Day 8 - 17th March
+Today I spent all my time, implementing the Lock-free distributed shard implementation for concurrent processing of data. You will recall that the previous implementation did not give significant gains which was caused by **Lock contention** on the centralised `WAL` file mostly. I implemented an updated version that builds on the existing context. The idea is to reduce contention, so we now maintain **256** shards each with its `queue`, `mutex` and a dedicated `WAL` file. Our Memory store now serves mostly as a router for routing keys to what shard it falls into.
+For Benchmarks, our new implementation improved performance drastically as we now have **13 seconds**  for **10 Million Records** with no `WAL` data and **7 seconds** processing time for when there are files in the `WAL` file
+```bash
+go run main.go ingest --file=~/Projects/personal/concile/data/inflow_10M.jsonl --provider=Vbank --workers=4
+⏱️  WAL Replay took 17.313334ms
+
+==================================================
+       WAL REPLAY REPORT
+==================================================
+Started At:     2026-03-17T19:04:46.780+01:00
+Ended At:       2026-03-17T19:04:46.797+01:00
+Duration:       17.3205ms
+
+==================================================
+2026/03/17 19:04:51 Current Backlog: 0/4000
+2026/03/17 19:04:56 Current Backlog: 256/4000
+Processed 2.65 GiB of data
+⏱️  Transaction Processor took 13.73s
+
+==============================
+       INGESTION REPORT
+==============================
+Processed:      10000000
+Failed:         0
+Duplicates:     0
+Duration:       13.73s
+
+==============================
+
+
+go run main.go ingest --file=~/Projects/personal/concile/data/inflow_10M.jsonl --provider=Vbank --workers=4
+⏱️  WAL Replay took 517.79475ms
+
+==================================================
+       WAL REPLAY REPORT
+==================================================
+Started At:     2026-03-17T19:05:11.833+01:00
+Ended At:       2026-03-17T19:05:12.351+01:00
+Duration:       517.808709ms
+
+==================================================
+2026/03/17 19:05:17 Current Backlog: 3933/4000
+Processed 2.65 GiB of data
+⏱️  Transaction Processor took 7.07s
+
+==============================
+       INGESTION REPORT
+==============================
+Processed:      0
+Failed:         0
+Duplicates:     10000000
+Duration:       7.07s
+
+==============================
+```
+
+CPU information shows that we have squeezed every juice from the CPU and it now spends most time waiting due to the `scheduling` overhead of goroutines. syscalls are now flat due to the updated batch writing implemented per shard
+
+```bash
+go tool pprof cpu.prof
+File: main
+Type: cpu
+Time: 2026-03-17 19:05:11 WAT
+Duration: 7.21s, Total samples = 28.50s (395.07%)
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top
+Showing nodes accounting for 25.93s, 90.98% of 28.50s total
+Dropped 150 nodes (cum <= 0.14s)
+Showing top 10 nodes out of 92
+      flat  flat%   sum%        cum   cum%
+    11.92s 41.82% 41.82%     11.92s 41.82%  runtime.usleep
+     7.04s 24.70% 66.53%      7.04s 24.70%  runtime.pthread_cond_wait
+     4.46s 15.65% 82.18%      4.46s 15.65%  runtime.pthread_cond_signal
+     0.73s  2.56% 84.74%      0.74s  2.60%  runtime.mapaccess2_fast64
+     0.58s  2.04% 86.77%      0.58s  2.04%  syscall.rawsyscalln
+     0.34s  1.19% 87.96%      0.34s  1.19%  encoding/json.stateInString
+     0.28s  0.98% 88.95%      0.28s  0.98%  runtime.memclrNoHeapPointers
+     0.24s  0.84% 89.79%      0.24s  0.84%  runtime.madvise
+     0.18s  0.63% 90.42%      0.66s  2.32%  encoding/json.checkValid
+     0.16s  0.56% 90.98%      0.16s  0.56%  encoding/json.(*decodeState).rescanLiteral
+```

@@ -1,35 +1,38 @@
 package persistence
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
+
+const DataDir = ".data"
 
 type WAL struct {
 	dataDir  string
 	filename string
-	file     io.ReadWriteCloser
+	writer   *bufio.Writer
+	file     *os.File
 	mu       sync.Mutex
+	buf      [8]byte
 }
 
 func NewWAL() (*WAL, error) {
-	wd, err := os.Getwd()
-	if err != nil {
-		return nil, err
-	}
-	dataDir := filepath.Join(wd, ".data")
-	err = os.MkdirAll(dataDir, os.ModePerm)
+	err := os.MkdirAll(DataDir, os.ModePerm)
 	if err != nil {
 		return nil, err
 	}
 
 	wal := &WAL{
-		dataDir:  dataDir,
-		filename: "wal.log",
+		dataDir:  DataDir,
+		filename: fmt.Sprintf("wal_%d.log", time.Now().UnixNano()),
+	}
+	if err := wal.CreateLogFile(); err != nil {
+		return nil, err
 	}
 	return wal, nil
 }
@@ -48,25 +51,37 @@ func (wal *WAL) CreateLogFile() error {
 	}
 	// No need to defer f.Close(), it will be called when we flush to disk
 	wal.file = f
+	wal.writer = bufio.NewWriterSize(f, 64*1024)
 	return nil
-}
-
-func (wal *WAL) DataDir() string {
-	wal.mu.Lock()
-	defer wal.mu.Unlock()
-
-	return wal.dataDir
 }
 
 func (wal *WAL) Append(keyHash uint64) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, keyHash) // encode the hash into a compact 8 byte for easy storage
+	binary.BigEndian.PutUint64(wal.buf[:], keyHash) // encode the hash into a compact 8 byte for easy storage
 
-	_, err := wal.file.Write(buf) // TODO: handle error if necessary
+	_, err := wal.file.Write(wal.buf[:]) // TODO: handle error if necessary
 	return err
+}
+
+func (wal *WAL) WriteBatch(batch []uint64) error {
+	for _, b := range batch {
+		binary.BigEndian.PutUint64(wal.buf[:], b)
+		if _, err := wal.writer.Write(wal.buf[:]); err != nil {
+			return err
+		}
+	}
+
+	// flush the internal 64KB buffer
+	if err := wal.writer.Flush(); err != nil {
+		return err
+	}
+
+	if err := wal.file.Sync(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (wal *WAL) Flush() error {
