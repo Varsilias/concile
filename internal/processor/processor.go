@@ -93,7 +93,8 @@ func Run(filePath, partner string, enableWAL bool, workers int) error {
 			case <-ticker.C:
 				log.Printf("Current Backlog: %d/%d", len(jobs), cap(jobs))
 			case <-ctx.Done():
-				log.Printf("interrupt recieved, stopping monitor...")
+				// log.Printf("interrupt recieved, stopping monitor...")
+				return
 			case <-done:
 				return
 			}
@@ -138,6 +139,7 @@ func Run(filePath, partner string, enableWAL bool, workers int) error {
 SHUTDOWN:
 	close(jobs)
 	wg.Wait()
+	store.Close()
 	close(done)
 	fmt.Printf("Processed %s of data\n", utils.Bytes(size))
 	return nil

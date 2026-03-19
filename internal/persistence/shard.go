@@ -16,11 +16,11 @@ type Shard struct {
 	seen  map[uint64]struct{}
 }
 
-func NewShard() (*Shard, error) {
+func NewShard(idx int) (*Shard, error) {
 
 	seen := map[uint64]struct{}{}
 	queue := make(chan uint64, QueueSize)
-	wal, err := NewWAL()
+	wal, err := NewWAL(idx)
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +52,15 @@ func (s *Shard) writer(ctx context.Context) {
 
 	for {
 		select {
-		case item := <-s.queue:
+		case item, ok := <-s.queue:
+			if !ok {
+				// The channel is closed and empty.
+				// Final flush and exit the goroutine.
+				if len(batch) > 0 {
+					s.flush(batch)
+				}
+				return
+			}
 			batch = append(batch, item)
 			if len(batch) >= QueueSize {
 				s.flush(batch)

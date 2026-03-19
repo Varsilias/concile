@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 )
 
 const DataDir = ".data"
@@ -21,7 +20,7 @@ type WAL struct {
 	buf      [8]byte
 }
 
-func NewWAL() (*WAL, error) {
+func NewWAL(idx int) (*WAL, error) {
 	err := os.MkdirAll(DataDir, os.ModePerm)
 	if err != nil {
 		return nil, err
@@ -29,7 +28,7 @@ func NewWAL() (*WAL, error) {
 
 	wal := &WAL{
 		dataDir:  DataDir,
-		filename: fmt.Sprintf("wal_%d.log", time.Now().UnixNano()),
+		filename: fmt.Sprintf("wal_%d.log", idx),
 	}
 	if err := wal.CreateLogFile(); err != nil {
 		return nil, err
