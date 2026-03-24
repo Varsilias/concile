@@ -1011,3 +1011,11 @@ Showing top 10 nodes out of 92
      0.18s  0.63% 90.42%      0.66s  2.32%  encoding/json.checkValid
      0.16s  0.56% 90.98%      0.16s  0.56%  encoding/json.(*decodeState).rescanLiteral
 ```
+# Day 9 - 18th March
+Today was mostly for tightening the shutdown process. Initially we have a fairly simple and minial shutdown process where we stop reading into the channel once user hits `CTRL-C`. Today I extended the process to the channels in each shard.
+## Implementation
+- User hits `CTRL-C`, we close the channel dedicated to the read
+- Wait for all workers to finish their job
+- Close the channels on each shard with `store.Close()` which also blocks and waits for the shard's channel to be drained
+- Close the done channel which is used to exit the logger
+- This entire step and process runs for interrupted ingestion or finished ingestion

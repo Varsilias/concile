@@ -116,6 +116,8 @@ def write_jsonl(filepath, builder_fn, total, chunk=50_000):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 JOBS = [
+    ("inflow.jsonl",   build_inflow,   100_000),
+    ("outflow.jsonl",  build_outflow,  100_000),
     ("inflow_1M.jsonl",   build_inflow,   1_000_000),
     ("outflow_1M.jsonl",  build_outflow,  1_000_000),
     ("inflow_10M.jsonl",  build_inflow,  10_000_000),

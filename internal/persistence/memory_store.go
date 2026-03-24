@@ -16,7 +16,10 @@ import (
 	"github.com/Varsilias/concile/internal/telemetry"
 )
 
-const ShardCount = 256
+const (
+	ShardCount          = 256
+	CompactionThreshold = 100 * 1 << 20 // 100MB
+)
 
 type IdempotencyStore interface {
 	Seen(key string) bool
